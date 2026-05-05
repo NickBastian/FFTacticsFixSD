@@ -23,7 +23,8 @@ jobs:
 
       # Build the entire solution so $(SolutionDir) resolves correctly for both
       # libMinHook (outputs to <root>\lib\Release\libMinHook.x64.lib) and
-      # FFTacticsFix (outputs to <root>\FFTacticsFix\x64\Release\FFTacticsFix.asi).
+      # FFTacticsFix (outputs to <root>\x64\Release\FFTacticsFix.asi via
+      # the MSBuild solution default: $(SolutionDir)$(Platform)\$(Configuration)\).
       - name: Build solution (Release|x64)
         run: |
           msbuild FFTacticsFix.sln `
@@ -31,11 +32,13 @@ jobs:
             /p:Platform=x64 `
             /m
 
-      - name: Verify output files exist
+      - name: Find and verify output files
         shell: pwsh
         run: |
+          # Show all .asi and .lib files produced so path is clear in logs
+          Get-ChildItem -Recurse -Include *.asi,libMinHook*.lib | Select-Object FullName
           $lib = "lib\Release\libMinHook.x64.lib"
-          $asi = "FFTacticsFix\x64\Release\FFTacticsFix.asi"
+          $asi = "x64\Release\FFTacticsFix.asi"
           foreach ($f in @($lib, $asi)) {
             if (!(Test-Path $f)) {
               Write-Error "Expected output not found: $f"
@@ -49,7 +52,7 @@ jobs:
         run: |
           $outDir = "release_package"
           New-Item -ItemType Directory -Path $outDir | Out-Null
-          Copy-Item "FFTacticsFix\x64\Release\FFTacticsFix.asi" "$outDir\FFTacticsFix.asi"
+          Copy-Item "x64\Release\FFTacticsFix.asi" "$outDir\FFTacticsFix.asi"
           Compress-Archive -Path "$outDir\*" -DestinationPath "FFTacticsFix.zip"
 
       - name: Compute SHA-256
