@@ -21,32 +21,36 @@ jobs:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build libMinHook (Release|x64)
+      # Build the entire solution so $(SolutionDir) resolves correctly for both
+      # libMinHook (outputs to <root>\lib\Release\libMinHook.x64.lib) and
+      # FFTacticsFix (outputs to <root>\FFTacticsFix\x64\Release\FFTacticsFix.asi).
+      - name: Build solution (Release|x64)
         run: |
-          msbuild external/minhook/build/VC17/libMinHook.vcxproj `
+          msbuild FFTacticsFix.sln `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:OutDir="${{ github.workspace }}/lib/Release/" `
             /m
 
-      - name: Build FFTacticsFix (Release|x64)
+      - name: Verify output files exist
+        shell: pwsh
         run: |
-          msbuild FFTacticsFix/FFTacticsFix.vcxproj `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /m
+          $lib = "lib\Release\libMinHook.x64.lib"
+          $asi = "FFTacticsFix\x64\Release\FFTacticsFix.asi"
+          foreach ($f in @($lib, $asi)) {
+            if (!(Test-Path $f)) {
+              Write-Error "Expected output not found: $f"
+              exit 1
+            }
+            Write-Output "OK: $f"
+          }
 
       - name: Package release artifact
         shell: pwsh
         run: |
           $outDir = "release_package"
           New-Item -ItemType Directory -Path $outDir | Out-Null
-
-          # Copy the built .asi
-          Copy-Item "FFTacticsFix/x64/Release/FFTacticsFix.asi" "$outDir/FFTacticsFix.asi"
-
-          # Zip it up
-          Compress-Archive -Path "$outDir/*" -DestinationPath "FFTacticsFix.zip"
+          Copy-Item "FFTacticsFix\x64\Release\FFTacticsFix.asi" "$outDir\FFTacticsFix.asi"
+          Compress-Archive -Path "$outDir\*" -DestinationPath "FFTacticsFix.zip"
 
       - name: Compute SHA-256
         id: sha
@@ -54,8 +58,8 @@ jobs:
         run: |
           $hash = (Get-FileHash FFTacticsFix.zip -Algorithm SHA256).Hash.ToLower()
           $line = "sha256:$hash"
-          $line | Out-File -FilePath sha256.txt -Encoding ascii
-          Write-Output "hash=$line" >> $env:GITHUB_OUTPUT
+          $line | Out-File -FilePath sha256.txt -Encoding ascii -NoNewline
+          "hash=$line" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
           Write-Output "SHA256: $line"
 
       - name: Create GitHub Release
