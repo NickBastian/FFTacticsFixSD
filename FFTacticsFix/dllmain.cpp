@@ -16,6 +16,7 @@ GameConfig Config;
 const int BASE_WIDTH = 1920;
 const int BASE_HEIGHT = 1080;
 const float BASE_ASPECT = 16.0f / 9.0f;
+const float STEAMDECK_ASPECT = 16.0f / 10.0f; // 1280x800
 
 int* FBO_W = 0;
 int* FBO_H = 0;
@@ -47,7 +48,22 @@ inline float GetAspectRatio()
     if (!m_iScreenW || !m_iScreenH)
         return BASE_ASPECT;
 
-    return *m_iScreenW / *m_iScreenH;
+    return (float)*m_iScreenW / (float)*m_iScreenH;
+}
+
+// Returns true if the current aspect ratio requires adjustment (16:10 SD or ultrawide)
+inline bool NeedsAspectAdjustment()
+{
+    float aspect = GetAspectRatio();
+    if (Config.SteamDeck)
+        return fabsf(aspect - STEAMDECK_ASPECT) < 0.01f || aspect > BASE_ASPECT;
+    return aspect > BASE_ASPECT;
+}
+
+// Returns true if we are in 16:10 Steam Deck mode (narrower than 16:9)
+inline bool IsSteamDeckAspect()
+{
+    return Config.SteamDeck && fabsf(GetAspectRatio() - STEAMDECK_ASPECT) < 0.01f;
 }
 
 inline int GetScaledFBOWidth(float renderScaleFactor) 
@@ -56,12 +72,34 @@ inline int GetScaledFBOWidth(float renderScaleFactor)
     int height = m_iScreenH ? *m_iScreenH : BASE_HEIGHT;
 
     float targetAspect = (float)width / (float)height;
+
+    if (Config.SteamDeck && fabsf(targetAspect - STEAMDECK_ASPECT) < 0.01f)
+    {
+        // For 16:10, keep FBO width at the base 16:9 width.
+        // The extra vertical space is gained by increasing FBO height instead.
+        return (int)(BASE_WIDTH * renderScaleFactor);
+    }
+
     float aspectCorrection = targetAspect <= BASE_ASPECT ? 1.0f : targetAspect / BASE_ASPECT;
     return (int)(BASE_WIDTH * aspectCorrection * renderScaleFactor);
 }
 
 inline int GetScaledFBOHeight(float renderScaleFactor) 
 {
+    if (Config.SteamDeck)
+    {
+        int width = m_iScreenW ? *m_iScreenW : BASE_WIDTH;
+        int height = m_iScreenH ? *m_iScreenH : BASE_HEIGHT;
+        float targetAspect = (float)width / (float)height;
+
+        if (fabsf(targetAspect - STEAMDECK_ASPECT) < 0.01f)
+        {
+            // Scale height so the FBO fills the full 16:10 screen vertically.
+            // BASE_WIDTH / STEAMDECK_ASPECT gives the correct height for a 16:10 FBO
+            // at BASE_WIDTH wide: 1920 / 1.6 = 1200.
+            return (int)((BASE_WIDTH / STEAMDECK_ASPECT) * renderScaleFactor);
+        }
+    }
     return (int)(BASE_HEIGHT * renderScaleFactor);
 }
 
@@ -129,9 +167,42 @@ CalculateViewportWithLetterboxing_t* CalculateViewportWithLetterboxing;
 int* __fastcall CalculateViewportWithLetterboxing_Hook(int* outRect, int contentWidth, int contentHeight, char preserveWidth)
 {
     float currentAspect = GetAspectRatio();
+
+    if (IsSteamDeckAspect())
+    {
+        // 16:10 screen (1280x800): scale content to fit height, letterbox top/bottom if needed.
+        // The game's native content is 16:9. On a 16:10 screen we want to stretch it to fill
+        // the full screen width and use the extra vertical space (i.e. true 16:10 rendering).
+        int screenWidth = *m_iScreenW;
+        int screenHeight = *m_iScreenH;
+
+        // Scale by width to fill the screen horizontally, giving extra vertical space
+        float scaleW = (float)screenWidth / (float)contentWidth;
+        int scaledWidth  = screenWidth;
+        int scaledHeight = (int)((float)contentHeight * scaleW);
+
+        if (scaledHeight > screenHeight)
+        {
+            // Fallback: scale by height if content is taller than screen
+            float scaleH = (float)screenHeight / (float)contentHeight;
+            scaledHeight = screenHeight;
+            scaledWidth  = (int)((float)contentWidth * scaleH);
+        }
+
+        int viewportX = (screenWidth  - scaledWidth)  / 2;
+        int viewportY = (screenHeight - scaledHeight) / 2;
+
+        outRect[0] = viewportX;
+        outRect[1] = viewportY;
+        outRect[2] = viewportX + scaledWidth;
+        outRect[3] = viewportY + scaledHeight;
+        return outRect;
+    }
+
     if (currentAspect <= BASE_ASPECT)
         return CalculateViewportWithLetterboxing(outRect, contentWidth, contentHeight, preserveWidth);
 
+    // Ultrawide path (aspect > 16:9)
     int letterboxOffsetX = 0;
     int letterboxOffsetY = 0;
 
@@ -164,14 +235,14 @@ UILayerUpdate_t* UILayerUpdate;
 char __fastcall UILayerUpdate_Hook(__int64 layer)
 {
     float currentAspect = GetAspectRatio();
-    if (currentAspect <= BASE_ASPECT)
+    if (currentAspect <= BASE_ASPECT && !IsSteamDeckAspect())
         return UILayerUpdate(layer);
 
     auto uiRenderer = *(__int64*)(*(uintptr_t*)GraphicsManager + 0x9430);
     auto firstLayer = *(__int64*)(uiRenderer + 0xD0);
 
     if (layer == firstLayer)
-        return 0; // hide pillarbox
+        return 0; // hide pillarbox / letterbox overlay
 
     return UILayerUpdate(layer);
 }
@@ -181,9 +252,25 @@ SetupCameraCenter_t* SetupCameraCenter;
 float* __fastcall SetupCameraCenter_Hook(__int64 a1, __int64 a2)
 {
     float currentAspect = GetAspectRatio();
-    if (currentAspect <= BASE_ASPECT)
-        return SetupCameraCenter(a1, a2);;
 
+    if (IsSteamDeckAspect())
+    {
+        // For 16:10, adjust camera slightly to account for the extra vertical space.
+        // The aspect delta vs 16:9 is negative (16:10 is narrower), so we shrink the
+        // horizontal offset accordingly — pulling the camera center inward.
+        float originalX = *(float*)(a2 + 120);
+        float aspectDelta = currentAspect - BASE_ASPECT; // will be negative for 16:10
+        float adjustment = aspectDelta * 105.0f;
+        *(float*)(a2 + 120) = originalX + adjustment;
+        float* result = SetupCameraCenter(a1, a2);
+        *(float*)(a2 + 120) = originalX;
+        return result;
+    }
+
+    if (currentAspect <= BASE_ASPECT)
+        return SetupCameraCenter(a1, a2);
+
+    // Ultrawide path
     float originalX = *(float*)(a2 + 120);
     float aspectDelta = currentAspect - BASE_ASPECT;
 
@@ -202,9 +289,24 @@ void __fastcall WorldToScreen_Hook(float* a1, float* a2, float* a3)
     WorldToScreen(a1, a2, a3);
 
     float currentAspect = GetAspectRatio();
+
+    if (IsSteamDeckAspect())
+    {
+        // For 16:10, the FBO is scaled to match the 16:10 screen dimensions.
+        // We need to correct the screen-space X position to account for the
+        // narrower aspect ratio vs the 16:9 base.
+        float factor = Config.RenderScale / 4.0f;
+        float scaledBaseWidth = BASE_WIDTH * factor;
+        float fboWidthDelta = (float)(*FBO_W) - scaledBaseWidth;
+        float offset = (fboWidthDelta * -0.0975f) / factor;
+        a2[0] = a2[0] + offset;
+        return;
+    }
+
     if (currentAspect <= BASE_ASPECT)
         return;
 
+    // Ultrawide path
     float factor = Config.RenderScale / 4.0f;
     float scaledBaseWidth = BASE_WIDTH * factor;
     float fboWidthDelta = (float)(*FBO_W) - scaledBaseWidth;
@@ -274,7 +376,10 @@ void PatchResolution()
 
 void PatchViewport()
 {
+    // Try to find screen width by 1920 (standard) first, then 1280 (Steam Deck)
     uintptr_t m_iScreenWOffset = (uintptr_t)Memory::PatternScan(GameModule, "BE 80 07 00 00 89 ?? ?? ?? ?? ??");
+    if (!m_iScreenWOffset && Config.SteamDeck)
+        m_iScreenWOffset = (uintptr_t)Memory::PatternScan(GameModule, "BE 00 05 00 00 89 ?? ?? ?? ?? ??"); // 1280 = 0x500
 
     if (!m_iScreenWOffset)
     {
@@ -282,7 +387,11 @@ void PatchViewport()
         return;
     }
 
+    // Try to find screen height by 1080 (standard) first, then 800 (Steam Deck)
     uintptr_t m_iScreenHOffset = (uintptr_t)Memory::PatternScan(GameModule, "B9 E0 04 00 00 89 ?? ?? ?? ?? ??");
+    if (!m_iScreenHOffset && Config.SteamDeck)
+        m_iScreenHOffset = (uintptr_t)Memory::PatternScan(GameModule, "B9 20 03 00 00 89 ?? ?? ?? ?? ??"); // 800 = 0x320
+
     if (!m_iScreenHOffset)
     {
         spdlog::error("Failed to find screen height offset");
@@ -305,12 +414,18 @@ void PatchViewport()
     if (setupCamCenterOffset && world2ScreenOffset && calcViewportOffset && rightPlaneClipOffset && 
         leftPlaneClipOffset && layerUpdateOffset && graphicsManagerOffset)
     {
-        DWORD oldProtect;
-        VirtualProtect((LPVOID)(leftPlaneClipOffset), 4, PAGE_READWRITE, &oldProtect);
-        VirtualProtect((LPVOID)(rightPlaneClipOffset), 4, PAGE_READWRITE, &oldProtect);
+        // Only expand clip planes for ultrawide (aspect > 16:9).
+        // For 16:10 (Steam Deck), the clip planes remain at their default 16:9 values;
+        // expanding them would cause geometry to render outside the visible area.
+        if (!IsSteamDeckAspect())
+        {
+            DWORD oldProtect;
+            VirtualProtect((LPVOID)(leftPlaneClipOffset), 4, PAGE_READWRITE, &oldProtect);
+            VirtualProtect((LPVOID)(rightPlaneClipOffset), 4, PAGE_READWRITE, &oldProtect);
 
-        *(float*)(leftPlaneClipOffset) = *(float*)(leftPlaneClipOffset) * -2;
-        *(float*)(rightPlaneClipOffset) = *(float*)(rightPlaneClipOffset) * 2;
+            *(float*)(leftPlaneClipOffset) = *(float*)(leftPlaneClipOffset) * -2;
+            *(float*)(rightPlaneClipOffset) = *(float*)(rightPlaneClipOffset) * 2;
+        }
 
         GraphicsManager = (uintptr_t)(graphicsManagerOffset + *(int*)(graphicsManagerOffset + 3) + 7);
 
@@ -450,6 +565,7 @@ void ReadConfig()
         ConfigValues["Settings"]["PreferMovies"] = "0";
         ConfigValues["Settings"]["DisableFilter"] = "0";
         ConfigValues["Settings"]["RenderScale"] = "4";
+        ConfigValues["Settings"]["SteamDeck"] = "1";
         ini.generate(ConfigValues);
     }
 
@@ -462,6 +578,9 @@ void ReadConfig()
     Config.PreferMovies = readConfigInt(ConfigValues["Settings"]["PreferMovies"], 0);
     Config.DisableFilter = readConfigInt(ConfigValues["Settings"]["DisableFilter"], 0);
     Config.RenderScale = readConfigInt(ConfigValues["Settings"]["RenderScale"], 4);
+    Config.SteamDeck = readConfigInt(ConfigValues["Settings"]["SteamDeck"], 1) != 0;
+
+    spdlog::info("Config: SteamDeck={}, RenderScale={}", Config.SteamDeck, Config.RenderScale);
 }
 
 DWORD WINAPI MainThread(LPVOID lpParam)
