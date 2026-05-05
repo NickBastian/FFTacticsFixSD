@@ -1,0 +1,74 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build libMinHook (Release|x64)
+        run: |
+          msbuild external/minhook/build/VC17/libMinHook.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:OutDir="${{ github.workspace }}/lib/Release/" `
+            /m
+
+      - name: Build FFTacticsFix (Release|x64)
+        run: |
+          msbuild FFTacticsFix/FFTacticsFix.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /m
+
+      - name: Package release artifact
+        shell: pwsh
+        run: |
+          $outDir = "release_package"
+          New-Item -ItemType Directory -Path $outDir | Out-Null
+
+          # Copy the built .asi
+          Copy-Item "FFTacticsFix/x64/Release/FFTacticsFix.asi" "$outDir/FFTacticsFix.asi"
+
+          # Zip it up
+          Compress-Archive -Path "$outDir/*" -DestinationPath "FFTacticsFix.zip"
+
+      - name: Compute SHA-256
+        id: sha
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash FFTacticsFix.zip -Algorithm SHA256).Hash.ToLower()
+          $line = "sha256:$hash"
+          $line | Out-File -FilePath sha256.txt -Encoding ascii
+          Write-Output "hash=$line" >> $env:GITHUB_OUTPUT
+          Write-Output "SHA256: $line"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          prerelease: true
+          body: |
+            ## Changes
+            See commit history for details.
+
+            ## SHA-256
+            `${{ steps.sha.outputs.hash }}`
+          files: |
+            FFTacticsFix.zip
+            sha256.txt
